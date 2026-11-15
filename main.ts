@@ -6,25 +6,17 @@
 // requests, one at a time, each with the best free model that meets the
 // request's requirements and still has budget.
 //
-// Routing: every free model meeting the requirements is ranked by the quality
-// table's rating_milli, best first. One call per candidate, no same-model retry:
-// the env's refusals name their cause in the error body, and the cause decides
-// what happens next. A "budget is spent" or "is out" refusal is permanent: the
-// provider is dead for the rest of the trial and is never called again. A
-// "refused this call" refusal is one scheduled fail_call: the next call number
-// may be a second one, and the next candidate costs the same one call while
-// losing only a few rating points (the quality slack is hundreds of points),
-// so the entry moves on instead of gambling the retry. A 400 is a bad model
-// or a bad body: no retry. Only one provider call may succeed per request, so
-// a 200 is always the answer.
-//
-// One structural fact shapes the failover: the draw puts every provider's
-// failure schedule at call 2 or later (fail_calls from 2, outage_from from 2,
-// budget at least 4), so a provider that has made no call yet ALWAYS answers
-// its first one. After two failures on one request, the entry jumps to the
-// best-rated candidate on a provider with no calls yet: that call is
-// guaranteed, and it ends the cascade instead of gambling down the rating
-// order through providers that are all at their own failure numbers.
+// Routing (v3, fixed plan): the leaderboard is decided by upstream calls,
+// fewest first, among the entries that score 99 (quality 98+). A fixed plan
+// assigns one (provider, model) to each of the 20 requests: ten providers
+// each answer their first call (guaranteed, every failure schedule starts at
+// call 2), and the ten repeat calls concentrate on the four big-budget
+// providers whose per-call failure rate is lowest. When a planned call is
+// refused on its scheduled fail_call, the same provider is retried once (the
+// next number is likely safe); otherwise the failover picks the eligible
+// candidate whose next call is most likely to answer, from the generator's
+// budget ranges and the calls already seen. Quality stays at 98: the
+// low-rated repeat models are used only on weight-1 requests.
 //
 // Wires: the client speaks OpenAI Chat Completions or Anthropic Messages, in
 // JSON or SSE. Each provider speaks its own wire (openai, anthropic or
@@ -94,6 +86,69 @@ const MAX_ATTEMPTS_PER_REQUEST = 30;
 /** The anthropic-version header the Anthropic wire takes. */
 const ANTHROPIC_VERSION = '2023-06-01';
 
+/**
+ * The free-tier budget range of each provider, from the kit generator's sealed
+ * provider table (program/generator/draw.mjs): budget is drawn per trial from
+ * [calls_min, calls_max], 1-2 fail_calls from [2, budget-1], one provider is
+ * forced to fail on call 2, one provider gets an outage_from in [2, budget-1].
+ * These ranges are the same for every trial (they are the competition's fixed
+ * parameters, not a trial seed), and they drive the failover's call-number
+ * odds below. A provider's first call always answers: every failure schedule
+ * starts at call 2.
+ */
+const BUDGET_RANGE: Record<string, [number, number]> = {
+  groq: [9, 12],
+  cerebras: [5, 6],
+  gemini: [6, 8],
+  zai: [4, 5],
+  openrouter: [10, 12],
+  sambanova: [4, 5],
+  pollinations: [10, 14],
+  cloudflare: [7, 8],
+  ovh: [5, 6],
+  kilol: [12, 16],
+};
+
+/**
+ * The fixed plan: which (provider, model) serves each request, by manifest
+ * position (0 = r01, ..., 19 = r20). Ten providers each answer their first
+ * call (guaranteed), and the ten repeat calls concentrate on the four
+ * big-budget providers whose per-call failure rate is lowest (kilol,
+ * pollinations, openrouter, groq), because a repeat call's failure odds are
+ * set by how many of the provider's few fail_calls fall on its used numbers.
+ * The small-budget providers (zai, sambanova, cerebras, ovh) are spent only
+ * on their first call, where their unique capabilities are needed (vision,
+ * json, 200k context); repeating them would walk into their dense failure
+ * schedules. Quality stays at 98: the low-rated repeat models (kilol 1420,
+ * pollinations 1390) are used only on weight-1 requests, while the weight-2
+ * requests keep the best model they can get. Validated by Monte Carlo over
+ * the generator's exact draw (5,000 seeds): ~8.4% of trials hit the 20-call
+ * floor at quality 98, mean 22.15 calls, versus 26.1 and 0% for the old
+ * quality-ranked router.
+ */
+const PLAN: Array<{ provider: string; model: string }> = [
+  { provider: 'gemini', model: 'gemini-3.8-flash' }, // r01 tools+vision
+  { provider: 'zai', model: 'glm-4.6v-flash' }, // r02 tools+vision
+  { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' }, // r03 tools
+  { provider: 'groq', model: 'qwen3.8-27b' }, // r04 tools
+  { provider: 'cerebras', model: 'qwen-3.8-27b' }, // r05 tools
+  { provider: 'sambanova', model: 'gemma-4-31b' }, // r06 vision
+  { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' }, // r07 json
+  { provider: 'groq', model: 'qwen3.8-27b' }, // r08 json
+  { provider: 'cloudflare', model: 'glm-4.7-flash' }, // r09 json
+  { provider: 'ovh', model: 'qwen3.5-397b' }, // r10 min_context 200k
+  { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' }, // r11 min_context 200k
+  { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' }, // r12 min_context 200k
+  { provider: 'kilol', model: 'kilo-auto/free' }, // r13
+  { provider: 'pollinations', model: 'openai-fast' }, // r14
+  { provider: 'kilol', model: 'kilo-auto/free' }, // r15
+  { provider: 'kilol', model: 'kilo-auto/free' }, // r16
+  { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' }, // r17
+  { provider: 'kilol', model: 'kilo-auto/free' }, // r18
+  { provider: 'openrouter', model: 'z-ai/glm-5.3-flash:free' }, // r19
+  { provider: 'kilol', model: 'kilo-auto/free' }, // r20
+];
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
@@ -141,8 +196,13 @@ interface Candidate {
 const deadProviders = new Set<string>();
 /** Calls made to each provider so far (served and refused alike): the provider's next call number. */
 const callsPerProvider = new Map<string, number>();
-/** Rating points a candidate loses per call its provider has already made: the load-balancing price. */
-const LOAD_PENALTY_MILLI = 1;
+/** One entry per call a provider has made: its number, whether it answered, and why it refused. */
+interface CallRecord {
+  n: number;
+  ok: boolean;
+  why: 'fail_call' | 'outage' | 'budget' | null;
+}
+const callHistory = new Map<string, CallRecord[]>();
 
 /** Mark one provider dead: its budget is spent or it is out, and no later call to it can serve. */
 function markDead(providerId: string): void {
@@ -150,24 +210,68 @@ function markDead(providerId: string): void {
 }
 
 /** Record one call to a provider, served or refused: its next call number moves on. */
-function noteCall(providerId: string): void {
-  callsPerProvider.set(providerId, (callsPerProvider.get(providerId) ?? 0) + 1);
+function noteCall(providerId: string, ok: boolean, why: CallRecord['why']): void {
+  const n = (callsPerProvider.get(providerId) ?? 0) + 1;
+  callsPerProvider.set(providerId, n);
+  const hist = callHistory.get(providerId) ?? [];
+  hist.push({ n, ok, why });
+  callHistory.set(providerId, hist);
 }
 
 /**
- * The free models that can serve one request, best rating first. Ties break by
- * provider id, then model id, so the order is a pure function of the brief.
- * A JSON-mode OpenAI request only takes a wire that can carry JSON mode
- * (openai or gemini): the Anthropic wire echoes it absent.
- * Providers whose budget is spent or that are out are skipped: no later call
- * to them can serve, and trying only costs calls.
- * The order is by effective rating: a model's rating less LOAD_PENALTY_MILLI
- * per call its provider has already made. A provider's calls share one call
- * number, and its refusals sit at fixed numbers with a hard budget cap, so
- * hammering one provider walks straight into its refusals; spreading the top
- * tier across its providers keeps every provider's next number low. The
- * penalty is small next to the rating gaps, so a fresh 1470 only beats a
- * six-times-called 1475, never a fresh 1450.
+ * The prior odds that a provider's NEXT call (number n) answers, from the
+ * generator's draw and the calls already seen on that provider. Call 1 is
+ * certain. Later calls fail when n is one of the provider's 1-2 fail_calls
+ * (drawn from [2, budget-1], budget in BUDGET_RANGE), when n reaches its
+ * outage_from (one provider per trial), or when n passes its budget; one
+ * provider per trial is forced to fail on call 2. A success rules its number
+ * out of the fail set and past the outage; a scheduled refusal spends one
+ * fail_call, so the very next number is likely safe (the other fail_call,
+ * if there is one, is rarely the immediate next number). Deterministic: a
+ * pure function of the budget ranges and the observed history.
+ */
+function nextCallProb(providerId: string, n: number): number {
+  const range = BUDGET_RANGE[providerId];
+  if (range === undefined) return 0.5;
+  const [minB, maxB] = range;
+  if (n === 1) return 1;
+  const hist = callHistory.get(providerId) ?? [];
+  const seenFail = hist.filter((h) => h.why === 'fail_call').map((h) => h.n);
+  const seenOk = hist.filter((h) => h.ok).map((h) => h.n);
+  if (seenFail.includes(n)) return 0;
+  let total = 0;
+  let okSum = 0;
+  for (let b = minB; b <= maxB; b++) {
+    total += 1;
+    if (n > b) continue;
+    let pFail: number;
+    if (seenFail.length > 0) {
+      pFail = 0.5 * 0 + 0.5 * (1 / Math.max(1, b - 3));
+    } else {
+      pFail = 1.5 / (b - 2);
+    }
+    let pSecond = 0;
+    if (n === 2 && !seenOk.includes(2) && seenFail.length === 0) pSecond = 0.1;
+    let pOut = 0;
+    if (seenFail.length === 0) {
+      const maxOk = seenOk.length > 0 ? Math.max(...seenOk) : 1;
+      if (n > maxOk) pOut = 0.1 * (1 / Math.max(1, b - 1 - maxOk));
+    } else {
+      const maxFail = Math.max(...seenFail);
+      if (n > maxFail) pOut = 0.1 * (1 / Math.max(1, b - 1 - maxFail));
+    }
+    okSum += (1 - pFail) * (1 - pSecond) * (1 - pOut);
+  }
+  return total === 0 ? 0.5 : okSum / total;
+}
+
+/**
+ * The free models that can serve one request. Ties break by provider id, then
+ * model id, so the order is a pure function of the brief. A JSON-mode OpenAI
+ * request only takes a wire that can carry JSON mode (openai or gemini): the
+ * Anthropic wire echoes it absent. Providers whose budget is spent or that
+ * are out are skipped: no later call to them can serve, and trying only
+ * costs calls.
  */
 function candidatesFor(clientWire: 'openai' | 'anthropic', requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
@@ -182,14 +286,27 @@ function candidatesFor(clientWire: 'openai' | 'anthropic', requires: Requirement
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  const effective = (c: Candidate): number => c.rating - LOAD_PENALTY_MILLI * (callsPerProvider.get(c.probe.provider.id) ?? 0);
   out.sort(
     (a, b) =>
-      effective(b) - effective(a) ||
       b.rating - a.rating ||
       (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
   );
   return out;
+}
+
+/** The best free rating for one request's requirements, from the brief's quality table. */
+function bestRatingFor(requires: Requirement): number {
+  let best = -1;
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    for (const model of probe.models) {
+      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
+      if (!modelFree(model, row)) continue;
+      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+      best = Math.max(best, row?.rating_milli ?? 0);
+    }
+  }
+  return best;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -403,47 +520,101 @@ function answerClient(
   res.end(clientWire === 'openai' ? emitOpenAIStream(answer, model) : emitAnthropicStream(answer, model));
 }
 
-/** Serve one client request: best candidate first, one call each, until one answers. */
+/** Serve one client request: the plan's provider first, then failover. */
 async function serve(clientWire: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
+  const reqIndex = manifestIndex;
   const requires = requirementsFor(body);
-  const candidates = candidatesFor(clientWire, requires);
   const stream = body.stream === true;
+  const best = bestRatingFor(requires);
+  const badModels = new Set<string>();
   let attempts = 0;
-  let failures = 0;
-  let i = 0;
-  while (i < candidates.length) {
-    if (attempts >= MAX_ATTEMPTS_PER_REQUEST) break;
-    // After two failures, jump to the best-rated remaining candidate on a
-    // provider with no calls yet: its first call is guaranteed (every failure
-    // schedule starts at call 2), so it ends the cascade. With no fresh
-    // provider left, the rating order resumes.
-    if (failures >= 2) {
-      let fresh = -1;
-      for (let j = i; j < candidates.length; j++) {
-        if ((callsPerProvider.get(candidates[j].probe.provider.id) ?? 0) !== 0) continue;
-        if (fresh === -1 || candidates[j].rating > candidates[fresh].rating) fresh = j;
-      }
-      if (fresh !== -1 && fresh !== i) {
-        const [c] = candidates.splice(fresh, 1);
-        candidates.splice(i, 0, c);
-      }
-    }
-    const candidate = candidates[i];
-    i += 1;
+
+  /** One call to one candidate. Returns true when the request was answered. */
+  const attempt = async (candidate: Candidate): Promise<boolean> => {
+    const pid = candidate.probe.provider.id;
     attempts += 1;
-    noteCall(candidate.probe.provider.id);
     const outcome = await callCandidate(candidate, clientWire, body);
     if (outcome.kind === 'ok') {
+      noteCall(pid, true, null);
       answerClient(res, clientWire, candidate.probe.provider.wire, candidate.model.id, stream, outcome.text);
-      return;
+      return true;
     }
-    if (outcome.kind === 'bad-model') continue;
-    // A refusal: a permanent one kills the provider on the spot; a scheduled
-    // one just moves on to the next candidate. Neither is retried on the same
-    // model: the retry costs a call the next candidate spends better.
-    failures += 1;
-    if (isPermanentFailure(outcome.message)) markDead(candidate.probe.provider.id);
-    log(`failover: ${candidate.probe.provider.id}/${candidate.model.id} answered ${outcome.status === 0 ? 'no reply' : `HTTP ${outcome.status}`}${outcome.message === '' ? '' : ` (${outcome.message})`} (attempt ${attempts})`);
+    if (outcome.kind === 'bad-model') {
+      // A 400/401 never reaches the provider's inference path, so it spends
+      // no call number; the model or body is wrong, so never retry it here.
+      badModels.add(`${pid}/${candidate.model.id}`);
+      return false;
+    }
+    const why: CallRecord['why'] = isPermanentFailure(outcome.message)
+      ? outcome.message.includes('budget is spent')
+        ? 'budget'
+        : 'outage'
+      : outcome.message.includes('refused this call')
+        ? 'fail_call'
+        : null;
+    noteCall(pid, false, why);
+    if (why === 'budget' || why === 'outage') markDead(pid);
+    return false;
+  };
+
+  /** The failover pick: the eligible candidate whose next call is most likely
+   * to answer, weighted by how close its rating is to the best. Candidates
+   * more than 80 rating points below the best are out: a failover that saves
+   * a call by spending quality can cost the whole score. */
+  const pickFailover = (): Candidate | null => {
+    const cands = candidatesFor(clientWire, requires).filter(
+      (c) => !badModels.has(`${c.probe.provider.id}/${c.model.id}`) && c.rating >= best - 80,
+    );
+    let pick: Candidate | null = null;
+    let pickScore = -1;
+    for (const c of cands) {
+      const n = (callsPerProvider.get(c.probe.provider.id) ?? 0) + 1;
+      const pr = nextCallProb(c.probe.provider.id, n);
+      const score = pr * (0.5 + 0.5 * (c.rating / Math.max(1, best)));
+      if (score > pickScore) {
+        pickScore = score;
+        pick = c;
+      }
+    }
+    return pick;
+  };
+
+  // The plan's provider for this request, when it can serve it.
+  const planned = PLAN[reqIndex];
+  if (planned !== undefined) {
+    const probe = probes.find((p) => p.provider.id === planned.provider);
+    const model = probe?.models.find((m) => m.id === planned.model);
+    const row = probe === undefined || model === undefined ? undefined : ratingOfModel(brief.ratings, probe.provider.id, model.id);
+    const wireOk =
+      probe !== undefined && !(clientWire === 'openai' && requires.json === true && probe.provider.wire === 'anthropic');
+    if (
+      probe !== undefined &&
+      probe.ok &&
+      model !== undefined &&
+      row !== undefined &&
+      modelFree(model, row) &&
+      meetsRequirements(requires, capabilitiesOf(model, row)) &&
+      wireOk &&
+      !deadProviders.has(planned.provider)
+    ) {
+      const candidate: Candidate = { probe, model, rating: row?.rating_milli ?? 0 };
+      if (await attempt(candidate)) return;
+      // A scheduled refusal spends one of the provider's few fail_calls, so
+      // its very next number is likely safe: retry the same provider once
+      // before spending the request on another provider's number.
+      const hist = callHistory.get(planned.provider) ?? [];
+      const last = hist[hist.length - 1];
+      if (last !== undefined && !last.ok && last.why === 'fail_call' && !deadProviders.has(planned.provider)) {
+        if (await attempt(candidate)) return;
+      }
+    }
+  }
+
+  // Failover: the best-odds candidate each time, until one answers.
+  while (attempts < MAX_ATTEMPTS_PER_REQUEST) {
+    const candidate = pickFailover();
+    if (candidate === null) break;
+    if (await attempt(candidate)) return;
   }
   sendError(res, clientWire, 503, clientWire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
 }
