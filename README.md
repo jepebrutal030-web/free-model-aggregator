@@ -18,11 +18,18 @@ the best free model that meets the request's requirements.
 - Registers port + catalog with the env, serves the client's 20 requests one
   at a time, polls `GET /work` and exits 0 when the env says done.
 - Routing: free models meeting the requirements, ranked by the quality
-  table's `rating_milli`, best first. A 402/429/5xx is retried once on the
-  same model (a failure on the provider's own schedule is transient), then the
-  request moves to the next candidate. A provider that fails twice in a row is
-  treated as spent for the rest of the trial. Only one provider call may
-  succeed per request, so a 200 is always the answer.
+  table's `rating_milli`, best first, with a 1-point penalty per call the
+  provider has already made (a provider's calls share one call number, and its
+  refusals sit at fixed numbers with a hard budget cap, so hammering one
+  provider walks straight into its refusals). One call per candidate, no
+  same-model retry: a refusal's error body names its cause, and a
+  "budget is spent" or "is out" refusal kills the provider on the spot, while a
+  "refused this call" refusal just moves on to the next candidate. After two
+  failures on one request, the entry jumps to the best-rated candidate on a
+  provider with no calls yet — its first call is guaranteed (every failure
+  schedule starts at call 2), so it ends the cascade. A 400 is a bad model or a
+  bad body: no retry. Only one provider call may succeed per request, so a 200
+  is always the answer.
 - Wires: each provider is called in its own wire (openai, anthropic or
   gemini) and the answer is translated back into the client's wire, with the
   provider's text whole, its usage counts as that wire reports them, and its
@@ -45,9 +52,17 @@ the best free model that meets the request's requirements.
 
 | trial | score | quality | served | wire | failover | catalog | calls |
 |-------|-------|---------|--------|------|----------|---------|-------|
-| trial-0 | 99 | 99 | 100 | 100 | 100 | 100 | 28 |
-| trial-1 | 99 | 99 | 100 | 100 | 100 | 100 | 30 |
-| trial-2 | 99 | 99 | 100 | 100 | 100 | 100 | 31 |
+| trial-0 | 99 | 99 | 100 | 100 | 100 | 100 | 26 |
+| trial-1 | 99 | 99 | 100 | 100 | 100 | 100 | 27 |
+| trial-2 | 99 | 99 | 100 | 100 | 100 | 100 | 25 |
+
+The leaderboard ranks by score first and breaks ties by upstream calls
+(lower is better), so the routing is tuned for few calls at score 99: the
+first version's retry-once policy spent 28/30/31 calls; this version spends
+26/27/25 by never retrying a refusal, killing a provider the moment its
+budget is spent or it is out, and jumping to a fresh provider after two
+failures on one request. The remaining failed calls are first hits on a
+provider's scheduled refusal numbers, which no entry can predict.
 
 Quality 99 is the ceiling on these trials: the best model for most requests
 (OpenRouter `z-ai/glm-5.3-flash:free`, 1475) has a per-trial budget of 10–12

@@ -7,11 +7,24 @@
 // request's requirements and still has budget.
 //
 // Routing: every free model meeting the requirements is ranked by the quality
-// table's rating_milli, best first. A provider call that answers 402, 429 or
-// a 5xx is retried once on the same model (a failure on the provider's own
-// schedule is transient: the next call may serve), then the request moves to
-// the next candidate. A 400 is a bad model or a bad body: no retry. Only one
-// provider call may succeed per request, so a 200 is always the answer.
+// table's rating_milli, best first. One call per candidate, no same-model retry:
+// the env's refusals name their cause in the error body, and the cause decides
+// what happens next. A "budget is spent" or "is out" refusal is permanent: the
+// provider is dead for the rest of the trial and is never called again. A
+// "refused this call" refusal is one scheduled fail_call: the next call number
+// may be a second one, and the next candidate costs the same one call while
+// losing only a few rating points (the quality slack is hundreds of points),
+// so the entry moves on instead of gambling the retry. A 400 is a bad model
+// or a bad body: no retry. Only one provider call may succeed per request, so
+// a 200 is always the answer.
+//
+// One structural fact shapes the failover: the draw puts every provider's
+// failure schedule at call 2 or later (fail_calls from 2, outage_from from 2,
+// budget at least 4), so a provider that has made no call yet ALWAYS answers
+// its first one. After two failures on one request, the entry jumps to the
+// best-rated candidate on a provider with no calls yet: that call is
+// guaranteed, and it ends the cascade instead of gambling down the rating
+// order through providers that are all at their own failure numbers.
 //
 // Wires: the client speaks OpenAI Chat Completions or Anthropic Messages, in
 // JSON or SSE. Each provider speaks its own wire (openai, anthropic or
@@ -124,20 +137,21 @@ interface Candidate {
   rating: number;
 }
 
-/** Providers that have failed twice in a row: treated as spent for the rest of the trial. */
+/** Providers whose budget is spent or that are out: dead for the rest of the trial, never called again. */
 const deadProviders = new Set<string>();
-/** Consecutive failed calls per provider, reset by any success. */
-const consecutiveFailures = new Map<string, number>();
+/** Calls made to each provider so far (served and refused alike): the provider's next call number. */
+const callsPerProvider = new Map<string, number>();
+/** Rating points a candidate loses per call its provider has already made: the load-balancing price. */
+const LOAD_PENALTY_MILLI = 1;
 
-/** Record one provider call's outcome: a success clears the streak, a refusal grows it. */
-function noteCall(providerId: string, failed: boolean): void {
-  if (!failed) {
-    consecutiveFailures.set(providerId, 0);
-    return;
-  }
-  const streak = (consecutiveFailures.get(providerId) ?? 0) + 1;
-  consecutiveFailures.set(providerId, streak);
-  if (streak >= 2) deadProviders.add(providerId);
+/** Mark one provider dead: its budget is spent or it is out, and no later call to it can serve. */
+function markDead(providerId: string): void {
+  deadProviders.add(providerId);
+}
+
+/** Record one call to a provider, served or refused: its next call number moves on. */
+function noteCall(providerId: string): void {
+  callsPerProvider.set(providerId, (callsPerProvider.get(providerId) ?? 0) + 1);
 }
 
 /**
@@ -145,8 +159,15 @@ function noteCall(providerId: string, failed: boolean): void {
  * provider id, then model id, so the order is a pure function of the brief.
  * A JSON-mode OpenAI request only takes a wire that can carry JSON mode
  * (openai or gemini): the Anthropic wire echoes it absent.
- * Providers that failed twice in a row are skipped: their budget is spent or
- * they are out, and retrying them only costs calls.
+ * Providers whose budget is spent or that are out are skipped: no later call
+ * to them can serve, and trying only costs calls.
+ * The order is by effective rating: a model's rating less LOAD_PENALTY_MILLI
+ * per call its provider has already made. A provider's calls share one call
+ * number, and its refusals sit at fixed numbers with a hard budget cap, so
+ * hammering one provider walks straight into its refusals; spreading the top
+ * tier across its providers keeps every provider's next number low. The
+ * penalty is small next to the rating gaps, so a fresh 1470 only beats a
+ * six-times-called 1475, never a fresh 1450.
  */
 function candidatesFor(clientWire: 'openai' | 'anthropic', requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
@@ -161,7 +182,13 @@ function candidatesFor(clientWire: 'openai' | 'anthropic', requires: Requirement
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  out.sort((a, b) => b.rating - a.rating || (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0));
+  const effective = (c: Candidate): number => c.rating - LOAD_PENALTY_MILLI * (callsPerProvider.get(c.probe.provider.id) ?? 0);
+  out.sort(
+    (a, b) =>
+      effective(b) - effective(a) ||
+      b.rating - a.rating ||
+      (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
+  );
   return out;
 }
 
@@ -262,7 +289,31 @@ function upstreamRequest(candidate: Candidate, clientWire: 'openai' | 'anthropic
 type CallOutcome =
   | { kind: 'ok'; status: number; text: string; sameWire: boolean }
   | { kind: 'bad-model' }
-  | { kind: 'retryable'; status: number };
+  | { kind: 'retryable'; status: number; message: string };
+
+/** The refusal's message out of an error body, in any of the three wires' shapes; '' when it has none. */
+function errorMessage(text: string): string {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed)) return '';
+    const error = parsed.error;
+    if (isRecord(error) && typeof error.message === 'string') return error.message;
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Whether a refusal is permanent: the provider's free-tier budget is spent
+ * ("<Name>'s free-tier budget is spent") or it is out ("<Name> is out"). Any
+ * other refusal ("<Name> refused this call", "<Name> serves N call at a
+ * time", a bare 5xx, no reply at all) is one scheduled refusal: the next call
+ * number may serve, so the provider stays alive.
+ */
+function isPermanentFailure(message: string): boolean {
+  return message.includes('budget is spent') || message.endsWith(' is out');
+}
 
 /** One call to one provider. A 200 is always an answer, never retried. */
 async function callCandidate(candidate: Candidate, clientWire: 'openai' | 'anthropic', body: Json): Promise<CallOutcome> {
@@ -271,7 +322,7 @@ async function callCandidate(candidate: Candidate, clientWire: 'openai' | 'anthr
   try {
     res = await fetch(call.url, { method: 'POST', headers: call.headers, body: call.body, signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
   } catch {
-    return { kind: 'retryable', status: 0 };
+    return { kind: 'retryable', status: 0, message: '' };
   }
   if (res.status === 400 || res.status === 401) {
     try {
@@ -282,12 +333,13 @@ async function callCandidate(candidate: Candidate, clientWire: 'openai' | 'anthr
     return { kind: 'bad-model' };
   }
   if (!res.ok) {
+    let message = '';
     try {
-      await res.text();
+      message = errorMessage(await res.text());
     } catch {
       // The body is spent either way.
     }
-    return { kind: 'retryable', status: res.status };
+    return { kind: 'retryable', status: res.status, message };
   }
   const text = await res.text();
   return { kind: 'ok', status: res.status, text, sameWire: candidate.probe.provider.wire === clientWire };
@@ -351,27 +403,47 @@ function answerClient(
   res.end(clientWire === 'openai' ? emitOpenAIStream(answer, model) : emitAnthropicStream(answer, model));
 }
 
-/** Serve one client request: best candidate first, retrying once per failure, until one answers. */
+/** Serve one client request: best candidate first, one call each, until one answers. */
 async function serve(clientWire: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
   const requires = requirementsFor(body);
   const candidates = candidatesFor(clientWire, requires);
   const stream = body.stream === true;
   let attempts = 0;
-  for (const candidate of candidates) {
-    for (let retry = 0; retry < 2; retry++) {
-      if (attempts >= MAX_ATTEMPTS_PER_REQUEST) break;
-      attempts += 1;
-      const outcome = await callCandidate(candidate, clientWire, body);
-      if (outcome.kind === 'ok') {
-        noteCall(candidate.probe.provider.id, false);
-        answerClient(res, clientWire, candidate.probe.provider.wire, candidate.model.id, stream, outcome.text);
-        return;
+  let failures = 0;
+  let i = 0;
+  while (i < candidates.length) {
+    if (attempts >= MAX_ATTEMPTS_PER_REQUEST) break;
+    // After two failures, jump to the best-rated remaining candidate on a
+    // provider with no calls yet: its first call is guaranteed (every failure
+    // schedule starts at call 2), so it ends the cascade. With no fresh
+    // provider left, the rating order resumes.
+    if (failures >= 2) {
+      let fresh = -1;
+      for (let j = i; j < candidates.length; j++) {
+        if ((callsPerProvider.get(candidates[j].probe.provider.id) ?? 0) !== 0) continue;
+        if (fresh === -1 || candidates[j].rating > candidates[fresh].rating) fresh = j;
       }
-      if (outcome.kind === 'bad-model') break;
-      // retryable: one retry on the same candidate, then the next candidate.
-      noteCall(candidate.probe.provider.id, true);
-      log(`failover: ${candidate.probe.provider.id}/${candidate.model.id} answered ${outcome.status === 0 ? 'no reply' : `HTTP ${outcome.status}`} (attempt ${attempts})`);
+      if (fresh !== -1 && fresh !== i) {
+        const [c] = candidates.splice(fresh, 1);
+        candidates.splice(i, 0, c);
+      }
     }
+    const candidate = candidates[i];
+    i += 1;
+    attempts += 1;
+    noteCall(candidate.probe.provider.id);
+    const outcome = await callCandidate(candidate, clientWire, body);
+    if (outcome.kind === 'ok') {
+      answerClient(res, clientWire, candidate.probe.provider.wire, candidate.model.id, stream, outcome.text);
+      return;
+    }
+    if (outcome.kind === 'bad-model') continue;
+    // A refusal: a permanent one kills the provider on the spot; a scheduled
+    // one just moves on to the next candidate. Neither is retried on the same
+    // model: the retry costs a call the next candidate spends better.
+    failures += 1;
+    if (isPermanentFailure(outcome.message)) markDead(candidate.probe.provider.id);
+    log(`failover: ${candidate.probe.provider.id}/${candidate.model.id} answered ${outcome.status === 0 ? 'no reply' : `HTTP ${outcome.status}`}${outcome.message === '' ? '' : ` (${outcome.message})`} (attempt ${attempts})`);
   }
   sendError(res, clientWire, 503, clientWire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
 }
